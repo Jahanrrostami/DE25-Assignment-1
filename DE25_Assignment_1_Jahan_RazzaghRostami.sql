@@ -148,8 +148,8 @@ BEGIN
         (6, 1000, 0.50);
 END;
 
--- April saknar medvetet ingen rad: maj 2025 och november 2026 har egen ränta.
--- Oktober 2026 ligger kvar så att reservräntan kan provas.
+-- Maj 2025 och november 2026 har en egen ränta.
+-- Oktober 2026 finns kvar så att reservräntan kan provas.
 IF NOT EXISTS (SELECT 1 FROM dbo.InterestRates)
 BEGIN
     INSERT INTO dbo.InterestRates (EffectiveDate, BaseInterestRate) VALUES
@@ -231,6 +231,7 @@ CREATE TABLE dbo.CarInformation_Staging (
     BasePrice        decimal(18,2)  NULL,
     FileMonth        date           NULL,
     CustomerRiskTier nvarchar(20)   NULL,
+    VehicleAge       int            NULL,
     IsValid          bit            NOT NULL CONSTRAINT DF_CarInformation_Staging_IsValid DEFAULT (0),
     RejectReason     nvarchar(400)  NULL
 );
@@ -253,8 +254,6 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @RunID uniqueidentifier = NEWID();
-    DECLARE @Started datetime2(0) = SYSDATETIME();
-    DECLARE @Finished datetime2(0);
     DECLARE @SourceTable sysname;
     DECLARE @SourceSchema sysname;
     DECLARE @TargetTable nvarchar(100);
@@ -367,6 +366,10 @@ BEGIN
         EXEC sys.sp_executesql @Sql;
         SET @RowsRead = @@ROWCOUNT;
 
+        UPDATE dbo.CarInformation_Staging
+        SET VehicleAge = YEAR(@MonthStart) - ManufactureYear
+        WHERE ManufactureYear IS NOT NULL;
+
         UPDATE s
         SET EnergyClass = COALESCE(directMatch.EnergyClass, synonymMatch.EnergyClass)
         FROM dbo.CarInformation_Staging AS s
@@ -400,9 +403,7 @@ BEGIN
                 CASE WHEN s.EnergyClass IS NULL THEN N'EnergyClass is missing or not in EnergyClassMargin' END,
                 CASE WHEN risk.RiskTier IS NULL THEN N'CustomerRiskTier is missing or not in CreditRiskTier' END,
                 CASE
-                    WHEN s.ManufactureYear IS NOT NULL
-                     AND (YEAR(@MonthStart) - s.ManufactureYear) > 0
-                     AND dep.DepreciationRate IS NULL
+                    WHEN s.VehicleAge > 0 AND dep.DepreciationRate IS NULL
                     THEN N'No depreciation band matches the vehicle age'
                 END
             ), N'')
@@ -416,7 +417,7 @@ BEGIN
         OUTER APPLY (
             SELECT TOP (1) r.DepreciationRate
             FROM dbo.DepreciationRates AS r
-            WHERE (YEAR(@MonthStart) - s.ManufactureYear) BETWEEN r.MinYear AND r.MaxYear
+            WHERE s.VehicleAge BETWEEN r.MinYear AND r.MaxYear
             ORDER BY r.MinYear
         ) AS dep;
 
@@ -476,16 +477,16 @@ BEGIN
                 s.BasePrice,
                 risk.RiskTier,
                 calc.FinalInterestRate,
-                CAST(ROUND(s.BasePrice * calc.FinalInterestRate / 100.0 / 12.0, 4) AS decimal(18,4)),
-                CAST(ROUND(s.BasePrice * (1 - calc.DepreciationRate), 2) AS decimal(18,2)),
-                CAST(ROUND(s.BasePrice * calc.FinalInterestRate / 100.0, 2) - ROUND(s.BasePrice * (calc.DepreciationRate - calc.PreviousDepreciationRate), 2) AS decimal(18,2)),
+                calc.EstimatedMonthlyPayment,
+                calc.DepreciatedValue,
+                calc.EstimatedProfit,
                 @MonthStart,
                 @BaseInterestRate,
                 @InterestEffectiveDate,
                 calc.VehicleAge,
                 calc.DepreciationRate,
                 calc.PreviousDepreciationRate,
-                CAST(ROUND(s.BasePrice * (calc.DepreciationRate - calc.PreviousDepreciationRate), 2) AS decimal(18,2)),
+                calc.DepreciationThisYear,
                 margin.MarginRate,
                 risk.RiskAdjustment
             FROM dbo.CarInformation_Staging AS s
@@ -493,33 +494,44 @@ BEGIN
                 ON LOWER(LTRIM(RTRIM(margin.EnergyClass))) = LOWER(s.EnergyClass)
             INNER JOIN dbo.CreditRiskTier AS risk
                 ON LOWER(LTRIM(RTRIM(risk.RiskTier))) = LOWER(s.CustomerRiskTier)
-            CROSS APPLY (
-                SELECT VehicleAge = YEAR(@MonthStart) - s.ManufactureYear
-            ) AS ages
             OUTER APPLY (
                 SELECT TOP (1) d.DepreciationRate
                 FROM dbo.DepreciationRates AS d
-                WHERE ages.VehicleAge BETWEEN d.MinYear AND d.MaxYear
+                WHERE s.VehicleAge BETWEEN d.MinYear AND d.MaxYear
                 ORDER BY d.MinYear
             ) AS curDep
             OUTER APPLY (
                 SELECT TOP (1) d.DepreciationRate
                 FROM dbo.DepreciationRates AS d
-                WHERE ages.VehicleAge - 1 BETWEEN d.MinYear AND d.MaxYear
+                WHERE s.VehicleAge - 1 BETWEEN d.MinYear AND d.MaxYear
                 ORDER BY d.MinYear
             ) AS prevDep
             CROSS APPLY (
                 SELECT
-                    ages.VehicleAge,
+                    s.VehicleAge,
                     DepreciationRate = CASE
-                        WHEN ages.VehicleAge <= 0 THEN CAST(0 AS decimal(8,2))
+                        WHEN s.VehicleAge <= 0 THEN CAST(0 AS decimal(8,2))
                         ELSE curDep.DepreciationRate
                     END,
                     PreviousDepreciationRate = CASE
-                        WHEN ages.VehicleAge - 1 <= 0 THEN CAST(0 AS decimal(8,2))
+                        WHEN s.VehicleAge - 1 <= 0 THEN CAST(0 AS decimal(8,2))
                         ELSE prevDep.DepreciationRate
                     END,
                     FinalInterestRate = CAST(@BaseInterestRate + margin.MarginRate + risk.RiskAdjustment AS decimal(8,2))
+            ) AS rates
+            CROSS APPLY (
+                SELECT
+                    rates.VehicleAge,
+                    rates.DepreciationRate,
+                    rates.PreviousDepreciationRate,
+                    rates.FinalInterestRate,
+                    DepreciatedValue = CAST(ROUND(s.BasePrice * (1 - rates.DepreciationRate), 2) AS decimal(18,2)),
+                    DepreciationThisYear = CAST(ROUND(s.BasePrice * (rates.DepreciationRate - rates.PreviousDepreciationRate), 2) AS decimal(18,2)),
+                    EstimatedMonthlyPayment = CAST(ROUND(s.BasePrice * rates.FinalInterestRate / 100.0 / 12.0, 4) AS decimal(18,4)),
+                    EstimatedProfit = CAST(
+                        ROUND(s.BasePrice * rates.FinalInterestRate / 100.0, 2)
+                        - ROUND(s.BasePrice * (rates.DepreciationRate - rates.PreviousDepreciationRate), 2)
+                        AS decimal(18,2))
             ) AS calc
             WHERE s.IsValid = 1;';
 
@@ -562,7 +574,6 @@ BEGIN
     FROM dbo.ETL_MailConfig
     WHERE ConfigID = 1;
 
-    SET @Finished = SYSDATETIME();
     SET @Subject = CASE
         WHEN @Succeeded = 1
         THEN N'Loan profit ETL succeeded - ' + ISNULL(@TargetTable, N'(no output table)')
